@@ -1,0 +1,234 @@
+name: WebGL SwiftShader diagnostic
+
+on:
+  push:
+    branches:
+      - 'codex/threejs-webgl-swiftshader-diagnostic'
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Compare original and SwiftShader unit browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 683672d6671cb3ae9dd9652b23b161a00b368ce5
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run isolated browser comparison
+        run: |
+          node --input-type=module <<'NODE'
+          import crypto from 'node:crypto';
+          import fs from 'node:fs';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { execFileSync } from 'node:child_process';
+          import { createServer } from './utils/server.js';
+          import puppeteer from 'puppeteer';
+
+          const expectedHead = '683672d6671cb3ae9dd9652b23b161a00b368ce5';
+          const expectedTest = 'Renderers > WebGLRenderer > updates instanced geometry when the shadow map is not updated';
+          const files = {
+            '/test/unit/UnitTests.html': 'test/unit/UnitTests.html',
+            '/test/unit/three.source.unit.js': 'test/unit/three.source.unit.js',
+            '/test/unit/src/renderers/WebGLRenderer.tests.js': 'test/unit/src/renderers/WebGLRenderer.tests.js',
+            '/src/renderers/WebGLRenderer.js': 'src/renderers/WebGLRenderer.js'
+          };
+          const digest = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+          const head = execFileSync('git', [ 'rev-parse', 'HEAD' ], { encoding: 'utf8' }).trim();
+          const startedUtc = new Date().toISOString();
+          const outputDir = path.join(process.env.RUNNER_TEMP, 'webgl-swiftshader-diagnostic');
+          fs.mkdirSync(outputDir, { recursive: true });
+          const expectedHashes = Object.fromEntries(Object.entries(files).map(([urlPath, filePath]) => [urlPath, digest(fs.readFileSync(filePath))]));
+          const server = createServer({ root: process.cwd() });
+          await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+          const origin = 'http://127.0.0.1:' + server.address().port;
+          const baseArgs = [ '--hide-scrollbars', '--enable-unsafe-webgpu', '--enable-features=Vulkan', '--disable-vulkan-surface', '--ignore-gpu-blocklist', '--disable-gpu-driver-bug-workarounds', '--no-sandbox' ];
+          const configs = [
+            { name: 'original', extraArgs: [] },
+            { name: 'swiftshader', extraArgs: [ '--use-gl=angle', '--use-angle=swiftshader' ] }
+          ];
+          const results = [];
+
+          async function run(config) {
+            const result = {
+              name: config.name, startedUtc: new Date().toISOString(), finishedUtc: null,
+              checkoutHead: head, expectedHead, checkoutMatchesExpected: head === expectedHead,
+              nodeVersion: process.version, runnerOS: process.env.RUNNER_OS ?? null,
+              runnerArchitecture: process.env.RUNNER_ARCH ?? null, kernel: os.release(),
+              platform: os.platform(), architecture: os.arch(),
+              launch: { headless: true, baseArgs, extraArgs: config.extraArgs, VK_DRIVER_FILES: '/usr/share/vulkan/icd.d/lvp_icd.x86_64.json' },
+              userDataDirFresh: true, testUrl: null, browserVersion: null, userAgent: null,
+              systemInfo: null, systemInfoError: null, cacheDisabled: true, serviceWorkerBypass: true,
+              serviceWorkerController: null, responses: [], requiredServedFiles: {}, webglContexts: [],
+              qunit: null, pageErrors: [], consoleErrors: [], stage: 'launch', error: null, pass: false
+            };
+            let browser;
+            const responseTasks = [];
+            const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'three-webgl-' + config.name + '-'));
+            try {
+              browser = await puppeteer.launch({
+                headless: true, args: [ ...baseArgs, ...config.extraArgs ],
+                env: { ...process.env, VK_DRIVER_FILES: '/usr/share/vulkan/icd.d/lvp_icd.x86_64.json' },
+                defaultViewport: null, handleSIGINT: false, protocolTimeout: 0, userDataDir: profile
+              });
+              result.browserVersion = await browser.version();
+              const page = await browser.newPage();
+              const client = await page.createCDPSession();
+              await client.send('Network.enable');
+              await client.send('Network.setCacheDisabled', { cacheDisabled: true });
+              await client.send('Network.setBypassServiceWorker', { bypass: true });
+              try {
+                const browserClient = await browser.target().createCDPSession();
+                result.systemInfo = await browserClient.send('SystemInfo.getInfo');
+              } catch (error) { result.systemInfoError = String(error); }
+              page.on('pageerror', error => result.pageErrors.push(String(error)));
+              page.on('console', message => { if (message.type() === 'error') result.consoleErrors.push(message.text()); });
+              page.on('response', response => {
+                const task = (async () => {
+                  const url = response.url();
+                  const parsed = new URL(url);
+                  const headers = response.headers();
+                  const record = {
+                    url, status: response.status(), origin: parsed.origin, path: parsed.pathname,
+                    contentType: headers['content-type'] ?? '',
+                    fromCache: typeof response.fromCache === 'function' ? response.fromCache() : null,
+                    fromServiceWorker: typeof response.fromServiceWorker === 'function' ? response.fromServiceWorker() : null
+                  };
+                  if (record.contentType.includes('javascript') || record.contentType.includes('text/html') || Object.hasOwn(files, parsed.pathname)) {
+                    try { record.sha256 = digest(await response.buffer()); }
+                    catch (error) { record.bodyError = String(error); }
+                  }
+                  result.responses.push(record);
+                })().catch(error => result.responses.push({ url: response.url(), handlerError: String(error) }));
+                responseTasks.push(task);
+              });
+              await page.evaluateOnNewDocument(() => {
+                window.__webglContexts = [];
+                window.__unitObservedTests = [];
+                window.__unitFailures = [];
+                const originalGetContext = HTMLCanvasElement.prototype.getContext;
+                HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+                  const context = Reflect.apply(originalGetContext, this, [ type, ...args ]);
+                  if (context && /webgl/i.test(type)) {
+                    const info = { requestedType: type };
+                    try {
+                      info.version = context.getParameter(context.VERSION);
+                      info.vendor = context.getParameter(context.VENDOR);
+                      info.renderer = context.getParameter(context.RENDERER);
+                      const debug = context.getExtension('WEBGL_debug_renderer_info');
+                      if (debug) {
+                        info.unmaskedVendor = context.getParameter(debug.UNMASKED_VENDOR_WEBGL);
+                        info.unmaskedRenderer = context.getParameter(debug.UNMASKED_RENDERER_WEBGL);
+                      }
+                    } catch (error) { info.error = String(error); }
+                    window.__webglContexts.push(info);
+                  }
+                  return context;
+                };
+                const attach = () => {
+                  if (!window.QUnit || window.__unitQUnitAttached) return;
+                  window.__unitQUnitAttached = true;
+                  window.QUnit.on('testEnd', test => {
+                    const entry = { name: test.fullName.join(' > '), status: test.status, passed: test.passed, failed: test.failed, skipped: test.skipped, todo: test.todo };
+                    window.__unitObservedTests.push(entry);
+                    if (test.status === 'failed') window.__unitFailures.push({ name: entry.name, messages: test.errors.map(error => error.message) });
+                  });
+                };
+                const timer = setInterval(() => { attach(); if (window.__unitQUnitAttached) clearInterval(timer); }, 1);
+              });
+              const url = new URL('/test/unit/UnitTests.html', origin);
+              url.searchParams.set('filter', 'updates instanced geometry when the shadow map is not updated');
+              result.testUrl = url.href;
+              result.stage = 'navigation';
+              await page.goto(url.href, { waitUntil: 'networkidle0', timeout: 300000 });
+              result.stage = 'qunit';
+              await page.waitForFunction(() => window._QUnitStats !== undefined, { timeout: 300000 });
+              await Promise.all(responseTasks);
+              const state = await page.evaluate(() => ({
+                stats: window._QUnitStats, observedTests: window.__unitObservedTests,
+                failures: window.__unitFailures, webglContexts: window.__webglContexts,
+                serviceWorkerController: navigator.serviceWorker?.controller != null
+              }));
+              result.userAgent = await page.evaluate(() => navigator.userAgent);
+              result.serviceWorkerController = state.serviceWorkerController;
+              result.webglContexts = state.webglContexts;
+              result.qunit = { stats: state.stats, observedTests: state.observedTests, failures: state.failures };
+              const checks = {};
+              for (const [urlPath, filePath] of Object.entries(files)) {
+                const served = result.responses.find(entry => entry.origin === origin && entry.path === urlPath);
+                checks[urlPath] = {
+                  expectedFile: filePath, expectedSha256: expectedHashes[urlPath],
+                  observedStatus: served?.status ?? null, observedSha256: served?.sha256 ?? null,
+                  fromCache: served?.fromCache ?? null, fromServiceWorker: served?.fromServiceWorker ?? null,
+                  pass: Boolean(served && served.status === 200 && served.sha256 === expectedHashes[urlPath] && served.fromCache === false && served.fromServiceWorker === false)
+                };
+              }
+              const qunitPass = Boolean(state.stats?.total === 1 && state.stats?.passed === 1 && state.stats?.failed === 0 && state.observedTests.length === 1 && state.observedTests[0].name === expectedTest && state.observedTests[0].status === 'passed');
+              result.requiredServedFiles = checks;
+              result.checks = {
+                exactCheckout: result.checkoutMatchesExpected,
+                filteredRegressionAssertion: qunitPass,
+                requiredFilesServedFreshAndMatchingCheckout: Object.values(checks).every(check => check.pass),
+                webglContextCreated: state.webglContexts.length > 0,
+                noServiceWorkerController: state.serviceWorkerController === false,
+                browserAndBackendInfoCaptured: Boolean(result.browserVersion && result.userAgent && (result.systemInfo || result.systemInfoError)),
+                pageErrorsAbsent: result.pageErrors.length === 0
+              };
+              result.pass = Object.values(result.checks).every(Boolean);
+              result.stage = 'complete';
+            } catch (error) { result.error = String(error?.stack ?? error); }
+            finally {
+              if (browser) { try { await browser.close(); } catch {} }
+              result.finishedUtc = new Date().toISOString();
+            }
+            return result;
+          }
+
+          try {
+            for (const config of configs) {
+              const result = await run(config);
+              results.push(result);
+              fs.writeFileSync(path.join(outputDir, config.name + '.json'), JSON.stringify(result, null, 2));
+              console.log(config.name.toUpperCase() + ' result: ' + (result.pass ? 'PASS' : 'FAIL') + ' at ' + result.stage);
+            }
+          } finally { await new Promise(resolve => server.close(resolve)); }
+          const finishedUtc = new Date().toISOString();
+          const swiftshader = results.find(result => result.name === 'swiftshader');
+          const report = {
+            diagnostic: 'PR #35100 WebGL unit regression browser comparison', sourceCommit: expectedHead,
+            workflowCommit: process.env.GITHUB_SHA ?? null, runId: process.env.GITHUB_RUN_ID ?? null,
+            runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null, startedUtc, finishedUtc,
+            runtime: { node: process.version, runnerOS: process.env.RUNNER_OS ?? null, runnerArchitecture: process.env.RUNNER_ARCH ?? null, kernel: os.release(), platform: os.platform(), architecture: os.arch() },
+            results
+          };
+          fs.writeFileSync(path.join(outputDir, 'comparison.json'), JSON.stringify(report, null, 2));
+          const summary = [
+            '# WebGL SwiftShader diagnostic', '',
+            '- Source checkout: ' + expectedHead + ' (' + (head === expectedHead ? 'exact' : 'MISMATCH') + ')',
+            '- Started: ' + startedUtc, '- Finished: ' + finishedUtc,
+            '- Original configuration: ' + (results[0]?.pass ? 'PASS' : 'FAIL'),
+            '- SwiftShader configuration: ' + (swiftshader?.pass ? 'PASS' : 'FAIL'),
+            '- Interpretation: ' + (results[0]?.pass && swiftshader?.pass ? 'both isolated runs passed; this does not establish a causal harness fix' : swiftshader?.pass ? 'only the SwiftShader configuration passed the isolated regression assertion' : 'the SwiftShader configuration did not pass all required checks')
+          ].join('\n') + '\n';
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          console.log(summary);
+          if (!swiftshader?.pass) process.exitCode = 1;
+          NODE
+      - name: Upload diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: webgl-swiftshader-diagnostic
+          path: ${{ runner.temp }}/webgl-swiftshader-diagnostic
+          if-no-files-found: error
