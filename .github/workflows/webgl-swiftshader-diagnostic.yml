@@ -20,7 +20,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers xvfb
-          test -r /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          if [ -d /usr/share/vulkan/icd.d ]; then
+            find /usr/share/vulkan/icd.d -maxdepth 1 -type f -print -exec sha256sum {} \; | tee diagnostic-receipts/vulkan-icds.txt
+          else
+            printf 'No Vulkan ICD directory found\n' | tee diagnostic-receipts/vulkan-icds.txt
+          fi
       - name: Checkout exact PR source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
