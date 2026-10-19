@@ -13,6 +13,8 @@ jobs:
     name: Headed WebGL unit diagnostic
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      focused_pass: ${{ steps.focused_unit.outputs.focused_pass }}
     steps:
       - name: Prepare diagnostic receipts
         run: mkdir -p diagnostic-receipts
@@ -40,6 +42,7 @@ jobs:
         working-directory: repo
         run: npm ci
       - name: Run focused, full unit, add-on, and coverage checks
+        id: focused_unit
         working-directory: repo
         run: |
           xvfb-run -a node --input-type=module <<'NODE'
@@ -54,7 +57,7 @@ jobs:
 
           const expectedHead = '683672d6671cb3ae9dd9652b23b161a00b368ce5';
           const expectedTest = 'Renderers > WebGLRenderer > updates instanced geometry when the shadow map is not updated';
-          const baseArgs = [
+          const baseArgs = Object.freeze([
             '--hide-scrollbars',
             '--enable-unsafe-webgpu',
             '--enable-features=Vulkan',
@@ -62,7 +65,7 @@ jobs:
             '--ignore-gpu-blocklist',
             '--disable-gpu-driver-bug-workarounds',
             '--no-sandbox'
-          ];
+          ]);
           const driverPath = '/usr/share/vulkan/icd.d/lvp_icd.x86_64.json';
           const receiptsDir = path.resolve('../diagnostic-receipts');
           fs.mkdirSync(receiptsDir, { recursive: true });
@@ -93,6 +96,7 @@ jobs:
             sourceCommit: head,
             expectedSourceCommit: expectedHead,
             exactSourceCommit: head === expectedHead,
+            workflowRun: { id: process.env.GITHUB_RUN_ID ?? null, sha: process.env.GITHUB_SHA ?? null, ref: process.env.GITHUB_REF ?? null },
             runtime: {
               node: process.version,
               runnerOS: process.env.RUNNER_OS ?? null,
@@ -106,8 +110,9 @@ jobs:
             graphicsProvision: {
               mesaVulkanIcdExists: fs.existsSync(driverPath),
               VK_DRIVER_FILES: driverPath,
+              installedVulkanIcds: fs.readFileSync(path.join(receiptsDir, 'vulkan-icds.txt'), 'utf8'),
               chromiumHeadless: false,
-              args: baseArgs
+              args: [ ...baseArgs ]
             },
             profile: { path: focusedProfile, newlyCreated: true },
             browserVersion: null,
@@ -131,7 +136,7 @@ jobs:
           try {
             browser = await puppeteer.launch({
               headless: false,
-              args: baseArgs,
+              args: [ ...baseArgs ],
               env: { ...process.env, VK_DRIVER_FILES: driverPath },
               defaultViewport: null,
               handleSIGINT: false,
@@ -242,7 +247,6 @@ jobs:
             focused.checks = {
               exactCheckout: focused.exactSourceCommit,
               displayAvailable: Boolean(focused.runtime.display),
-              mesaVulkanIcdAvailable: focused.graphicsProvision.mesaVulkanIcdExists,
               filteredPixelAssertionPassed: qunitPass,
               requiredModulesFreshAndMatching: Object.values(moduleChecks).every(check => check.pass),
               actualWebglContextCreated: state.webglContexts.length > 0,
@@ -259,6 +263,7 @@ jobs:
             await new Promise(resolve => server.close(resolve));
           }
           console.log('Focused headed result: ' + (focused.pass ? 'PASS' : 'FAIL'));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `focused_pass=${focused.pass}\n`);
           const results = { focused, fullUnit: null, addons: null, coverage: null };
 
           async function captureCommand(name, args) {
@@ -291,7 +296,7 @@ jobs:
               freshProfilePath: profile,
               freshProfileWasAbsent: !fs.existsSync(profile),
               headedDisplay: process.env.DISPLAY ?? null,
-              runnerFlags: baseArgs,
+              runnerFlags: [ ...baseArgs ],
               VK_DRIVER_FILES: driverPath,
               browserVersion: null,
               userAgent: null,
@@ -361,7 +366,7 @@ jobs:
               });
               receipt.runnerExitCode = exit.code;
               receipt.runnerSignal = exit.signal;
-              receipt.pass = Boolean(state.stats?.total > 0 && state.stats?.failed === 0 && exit.code === 0);
+              receipt.pass = Boolean(state.stats?.total === 1969 && state.stats?.failed === 0 && exit.code === 0);
             } catch (error) {
               receipt.sidecarError = String(error?.stack ?? error);
               if (testPage) { try { await testPage.close(); } catch {} }
@@ -396,6 +401,7 @@ jobs:
             finishedUtc: new Date().toISOString(),
             sourceCommit: head,
             expectedSourceCommit: expectedHead,
+            workflowRun: { id: process.env.GITHUB_RUN_ID ?? null, sha: process.env.GITHUB_SHA ?? null, ref: process.env.GITHUB_REF ?? null },
             runner: { node: process.version, os: os.release(), platform: os.platform(), architecture: os.arch(), display: process.env.DISPLAY ?? null, mesaVulkanIcd: fs.existsSync(driverPath), VK_DRIVER_FILES: driverPath },
             results
           };
@@ -424,4 +430,78 @@ jobs:
         with:
           name: webgl-headed-xvfb-diagnostic
           path: diagnostic-receipts/
+          if-no-files-found: warn
+
+  camera:
+    name: Fresh headed WebGPU camera comparison
+    needs: compare
+    if: always() && needs.compare.outputs.focused_pass == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Prepare camera receipts
+        run: mkdir -p camera-receipts
+      - name: Install E2E graphics dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers xvfb
+          if [ -d /usr/share/vulkan/icd.d ]; then
+            find /usr/share/vulkan/icd.d -maxdepth 1 -type f -print -exec sha256sum {} \; | tee camera-receipts/vulkan-icds.txt
+          else
+            printf 'No Vulkan ICD directory found\n' | tee camera-receipts/vulkan-icds.txt
+          fi
+      - name: Checkout exact PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 683672d6671cb3ae9dd9652b23b161a00b368ce5
+          path: repo
+      - name: Install Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: repo/package-lock.json
+      - name: Install dependencies
+        working-directory: repo
+        run: npm ci
+      - name: Build and run exactly one headed WebGPU camera comparison
+        working-directory: repo
+        run: |
+          set +e
+          npm run build > ../camera-receipts/build.log 2>&1
+          build_exit=$?
+          set -e
+          cat ../camera-receipts/build.log
+          test "$build_exit" -eq 0
+          test ! -e test/e2e/output-screenshots
+          test ! -e .puppeteer_profile
+          source_commit=$(git rev-parse HEAD)
+          test "$source_commit" = '683672d6671cb3ae9dd9652b23b161a00b368ce5'
+          {
+            printf 'started_utc=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            printf 'source_commit=%s\n' "$source_commit"
+            printf 'workflow_commit=%s\nrun_id=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID"
+            printf 'workflow_ref=%s\n' "$GITHUB_REF"
+            printf 'node=%s\n' "$(node --version)"
+            printf 'kernel=%s\n' "$(uname -sr)"
+            printf 'ci=unset\nvisible=1\n'
+            printf 'screenshots_path_preexisting=false\nprofile_preexisting=false\n'
+          } > ../camera-receipts/result.txt
+          set +e
+          env -u CI VISIBLE=1 xvfb-run -a sh -c 'printf "DISPLAY=%s\\n" "$DISPLAY"; npm run test-e2e -- webgpu_camera' > ../camera-receipts/webgpu-camera.log 2>&1
+          camera_exit=$?
+          set -e
+          cat ../camera-receipts/webgpu-camera.log
+          comparison_count=$(grep -F -c 'in file: webgpu_camera (' ../camera-receipts/webgpu-camera.log || true)
+          printf 'finished_utc=%s\nexit=%s\ncomparison_count=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$camera_exit" "$comparison_count" >> ../camera-receipts/result.txt
+          test "$comparison_count" -eq 1
+          test "$camera_exit" -eq 0
+      - name: Upload camera logs and generated outputs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: headed-webgpu-camera-diagnostic
+          path: |
+            camera-receipts/
+            repo/test/e2e/output-screenshots/
           if-no-files-found: warn
